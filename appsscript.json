@@ -1,5 +1,5 @@
 {
-  "timeZone": "Etc/UTC",
+  "timeZone": "Europe/London",
   "dependencies": {
     "enabledAdvancedServices": [
       {
@@ -11,7 +11,8 @@
   },
   "oauthScopes": [
     "https://www.googleapis.com/auth/documents.currentonly",
-    "https://www.googleapis.com/auth/drive.readonly"
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/script.container.ui"
   ],
   "exceptionLogging": "STACKDRIVER",
   "runtimeVersion": "V8"
