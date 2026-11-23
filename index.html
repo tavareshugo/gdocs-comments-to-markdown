@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      body {
+        box-sizing: border-box;
+        font-family: Arial, sans-serif;
+        margin: 0;
+        padding: 16px;
+      }
+
+      .container {
+        margin: 0 auto;
+        max-width: 1000px;
+      }
+
+      .row {
+        display: flex;
+        gap: 8px;
+      }
+
+      input[type='text'] {
+        box-sizing: border-box;
+        flex: 1;
+        font-size: 14px;
+        padding: 10px;
+        width: 100%;
+      }
+
+      button {
+        font-size: 14px;
+        padding: 10px 14px;
+      }
+
+      #status {
+        color: #188038;
+        display: block;
+        font-size: 13px;
+        margin: 10px 0;
+        min-height: 1em;
+      }
+
+      #status.error {
+        color: #d93025;
+      }
+
+      textarea {
+        box-sizing: border-box;
+        font-family: monospace;
+        font-size: 13px;
+        height: 65vh;
+        resize: vertical;
+        width: 100%;
+      }
+
+      .actions {
+        margin-top: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="row">
+        <input id="docUrl" type="text" placeholder="Paste a Google Docs URL" autofocus>
+        <button id="extract" type="button">Extract</button>
+      </div>
+      <span id="status" role="status"></span>
+      <textarea id="output" readonly aria-label="Markdown output"></textarea>
+      <div class="actions">
+        <button id="copy" type="button">Copy to clipboard</button>
+      </div>
+    </div>
+    <script>
+      var urlInput = document.getElementById('docUrl');
+      var extractButton = document.getElementById('extract');
+      var copyButton = document.getElementById('copy');
+      var status = document.getElementById('status');
+      var output = document.getElementById('output');
+
+      urlInput.value = sessionStorage.getItem('lastDocUrl') || '';
+
+      function setStatus(message, isError) {
+        status.textContent = message;
+        status.className = isError ? 'error' : '';
+      }
+
+      function countThreads(markdown) {
+        return String(markdown || '')
+          .split('\n')
+          .filter(function (line) {
+            return /^##\s/.test(line);
+          }).length;
+      }
+
+      function runExtraction() {
+        var url = urlInput.value.trim();
+        sessionStorage.setItem('lastDocUrl', url);
+        extractButton.disabled = true;
+        setStatus('Working...', false);
+
+        google.script.run
+          .withSuccessHandler(function (result) {
+            output.value = result;
+            setStatus('Done: ' + countThreads(result) + ' threads', false);
+            extractButton.disabled = false;
+          })
+          .withFailureHandler(function (error) {
+            var message = (error && error.message) ? error.message : String(error);
+            setStatus(message, true);
+            extractButton.disabled = false;
+          })
+          .extractCommentsMarkdown(url);
+      }
+
+      extractButton.addEventListener('click', runExtraction);
+      urlInput.addEventListener('keydown', function (event) {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          runExtraction();
+        }
+      });
+
+      copyButton.addEventListener('click', function () {
+        var text = output.value;
+        var copyPromise = navigator.clipboard && navigator.clipboard.writeText
+          ? navigator.clipboard.writeText(text)
+          : Promise.resolve().then(function () {
+            output.focus();
+            output.select();
+            return document.execCommand('copy');
+          });
+
+        copyPromise.then(function () {
+          setStatus('Copied', false);
+          window.setTimeout(function () {
+            setStatus('', false);
+          }, 1500);
+        }).catch(function () {
+          output.focus();
+          output.select();
+          if (document.execCommand('copy')) {
+            setStatus('Copied', false);
+          } else {
+            setStatus('Copy failed', true);
+          }
+        });
+      });
+    </script>
+  </body>
+</html>

@@ -1,130 +1,69 @@
-function onOpen() {
-  DocumentApp.getUi()
-    .createMenu('Comments Export')
-    .addItem('Extract comments to Markdown', 'showCommentsMarkdown')
-    .addToUi();
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile('index')
+    .setTitle('Comments to Markdown');
 }
 
-function showCommentsMarkdown() {
-  var ui = DocumentApp.getUi();
-
-  try {
-    var prompt = ui.prompt(
-      'Document URL',
-      'Paste the URL of the Google Doc to export comments from.',
-      ui.ButtonSet.OK_CANCEL
-    );
-    if (prompt.getSelectedButton() !== ui.Button.OK) {
-      return;
-    }
-
-    var url = prompt.getResponseText().trim();
-    var match = url.match(/\/d\/([a-zA-Z0-9_-]+)/);
-    if (!match) {
-      ui.alert(
-        'Unrecognised document URL',
-        'The URL was not recognised. Paste a Google Docs URL containing /d/{document-id}.',
-        ui.ButtonSet.OK
-      );
-      return;
-    }
-
-    var fileId = match[1];
-    var title = Drive.Files.get(fileId, {fields: 'name'}).name;
-    var threads = orderThreadsByDocumentPosition_(fetchComments_(fileId), fileId)
-      .filter(function (thread) {
-        return thread.resolved !== true;
-      });
-    var markdown = threads.length
-      ? buildMarkdown_(title, threads)
-      : 'No open comments found.';
-    var template = HtmlService.createTemplateFromFile('dialog');
-    template.markdownJson = jsonForScript_(markdown);
-
-    ui.showModalDialog(
-      template.evaluate().setWidth(700).setHeight(550),
-      'Comments as Markdown'
-    );
-  } catch (e) {
-    var message = e && e.message ? e.message : String(e);
-    if (e && e.stack) {
-      message += '\n\n' + e.stack;
-    }
-    ui.alert(
-      'Unable to export comments',
-      message,
-      ui.ButtonSet.OK
-    );
+function extractCommentsMarkdown(docUrl) {
+  var fileId = extractDocId_(docUrl);
+  if (!fileId) {
+    throw new Error("That doesn't look like a Google Docs URL.");
   }
+
+  var title = Drive.Files.get(fileId, {fields: 'name'}).name;
+  var threads = orderThreadsByDocumentPosition_(fetchComments_(fileId), fileId)
+    .filter(function (thread) {
+      return thread.resolved !== true;
+    });
+  return threads.length
+    ? buildMarkdown_(title, threads)
+    : 'No open comments found.';
+}
+
+function extractDocId_(docUrl) {
+  var match = String(docUrl || '').match(/\/d\/([a-zA-Z0-9_-]+)/);
+  return match ? match[1] : '';
 }
 
 function debugExportHtml() {
-  var ui = DocumentApp.getUi();
-  var prompt = ui.prompt(
-    'Document URL',
-    'Paste the URL of the Google Doc to inspect.',
-    ui.ButtonSet.OK_CANCEL
+  var DEBUG_DOC_URL = 'PASTE_A_GOOGLE_DOCS_URL_HERE';
+  var fileId = extractDocId_(DEBUG_DOC_URL);
+  if (!fileId) {
+    throw new Error("Set DEBUG_DOC_URL to a valid Google Docs URL before running debugExportHtml().");
+  }
+
+  var html = fetchHtmlExport_(fileId);
+  var parsed = parseCommentExportHtml_(html);
+  var comments = fetchComments_(fileId);
+  var ordered = orderThreadsByDocumentPosition_(comments, fileId, html, parsed);
+
+  Logger.log('HTML length: ' + html.length);
+  Logger.log('Body markers: ' + JSON.stringify(parsed.markers));
+  Logger.log('Comment blocks: ' + JSON.stringify(parsed.blocks.map(function (block) {
+    return {
+      id: block.id,
+      refId: block.refId,
+      markerIndex: block.markerIndex === undefined ? null : block.markerIndex,
+      text: truncate_(block.text, 80)
+    };
+  })));
+  var entries = getApiEntries_(ordered);
+  Logger.log(
+    'Parsed %s body markers, %s comment blocks, %s matched API entries.',
+    parsed.markers.length,
+    parsed.blocks.length,
+    entries.filter(function (entry) {
+      return entry.markerIndex !== null;
+    }).length
   );
-  if (prompt.getSelectedButton() !== ui.Button.OK) {
-    return;
-  }
-
-  var match = prompt.getResponseText().trim().match(/\/d\/([a-zA-Z0-9_-]+)/);
-  if (!match) {
-    ui.alert(
-      'Unrecognised document URL',
-      'The URL was not recognised. Paste a Google Docs URL containing /d/{document-id}.',
-      ui.ButtonSet.OK
-    );
-    return;
-  }
-
-  try {
-    var fileId = match[1];
-    var html = fetchHtmlExport_(fileId);
-    var parsed = parseCommentExportHtml_(html);
-    var comments = fetchComments_(fileId);
-    var ordered = orderThreadsByDocumentPosition_(comments, fileId, html, parsed);
-
-    Logger.log('HTML length: ' + html.length);
-    Logger.log('Body markers: ' + JSON.stringify(parsed.markers));
-    Logger.log('Comment blocks: ' + JSON.stringify(parsed.blocks.map(function (block) {
-      return {
-        id: block.id,
-        refId: block.refId,
-        markerIndex: block.markerIndex === undefined ? null : block.markerIndex,
-        text: truncate_(block.text, 80)
-      };
-    })));
-    var entries = getApiEntries_(ordered);
+  entries.forEach(function (entry) {
     Logger.log(
-      'Parsed %s body markers, %s comment blocks, %s matched API entries.',
-      parsed.markers.length,
-      parsed.blocks.length,
-      entries.filter(function (entry) {
-        return entry.markerIndex !== null;
-      }).length
+      '%s %s: %s (marker index: %s)',
+      entry.type,
+      entry.id,
+      truncate_(normalizeText_(entry.content), 80),
+      entry.markerIndex === null ? 'not matched' : entry.markerIndex
     );
-    entries.forEach(function (entry) {
-      Logger.log(
-        '%s %s: %s (marker index: %s)',
-        entry.type,
-        entry.id,
-        truncate_(normalizeText_(entry.content), 80),
-        entry.markerIndex === null ? 'not matched' : entry.markerIndex
-      );
-    });
-  } catch (e) {
-    Logger.log('Debug export failed: ' + (e.message || e));
-    if (e.stack) {
-      Logger.log(e.stack);
-    }
-    ui.alert(
-      'Unable to debug HTML export',
-      (e.message || String(e)) + (e.stack ? '\n\n' + e.stack : ''),
-      ui.ButtonSet.OK
-    );
-  }
+  });
 }
 
 function fetchComments_(fileId) {
@@ -544,14 +483,4 @@ function formatExportDate_() {
     Session.getScriptTimeZone(),
     'yyyy-MM-dd'
   );
-}
-
-
-function jsonForScript_(value) {
-  return JSON.stringify(value)
-    .replace(/</g, '\\u003c')
-    .replace(/>/g, '\\u003e')
-    .replace(/&/g, '\\u0026')
-    .replace(/\u2028/g, '\\u2028')
-    .replace(/\u2029/g, '\\u2029');
 }
