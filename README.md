@@ -1,5 +1,8 @@
 # Comments to Markdown (Google Apps Script Web App)
 
+[![MIT license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+![AI-built](https://img.shields.io/badge/ai-built%20with%20copilot-a08bff)
+
 This tool exports **open Google Docs comment threads** to Markdown.
 It uses the Drive API for comment data and document title, and orders threads by their position in the document (with fallback to creation order when needed).
 
