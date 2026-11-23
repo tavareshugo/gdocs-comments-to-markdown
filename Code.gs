@@ -9,10 +9,34 @@ function showCommentsMarkdown() {
   var ui = DocumentApp.getUi();
 
   try {
-    var document = DocumentApp.getActiveDocument();
-    var threads = fetchOpenComments_(document.getId());
+    var prompt = ui.prompt(
+      'Document URL',
+      'Paste the URL of the Google Doc to export comments from.',
+      ui.ButtonSet.OK_CANCEL
+    );
+    if (prompt.getSelectedButton() !== ui.Button.OK) {
+      return;
+    }
+
+    var url = prompt.getResponseText().trim();
+    var match = url.match(/\/d\/([a-zA-Z0-9_-]+)/);
+    if (!match) {
+      ui.alert(
+        'Unrecognised document URL',
+        'The URL was not recognised. Paste a Google Docs URL containing /d/{document-id}.',
+        ui.ButtonSet.OK
+      );
+      return;
+    }
+
+    var fileId = match[1];
+    var title = Drive.Files.get(fileId, {fields: 'name'}).name;
+    var threads = orderThreadsByDocumentPosition_(fetchComments_(fileId), fileId)
+      .filter(function (thread) {
+        return thread.resolved !== true;
+      });
     var markdown = threads.length
-      ? buildMarkdown_(document.getName(), threads)
+      ? buildMarkdown_(title, threads)
       : 'No open comments found.';
     var template = HtmlService.createTemplateFromFile('dialog');
     template.markdownJson = jsonForScript_(markdown);
@@ -21,14 +45,10 @@ function showCommentsMarkdown() {
       template.evaluate().setWidth(700).setHeight(550),
       'Comments as Markdown'
     );
-  } catch (error) {
-    var message = error && error.message ? error.message : String(error);
-    if (/getActiveDocument/i.test(message)) {
-      message =
-        'This script must be bound to a Google Doc. Open the target Doc, then use ' +
-        'Extensions > Apps Script and run the menu item from that document.';
-    } else if (/advanced service|drive\.comments|service.*enabled|not found/i.test(message)) {
-      message += '\n\nEnable the Drive API advanced service in Extensions > Apps Script > Services.';
+  } catch (e) {
+    var message = e && e.message ? e.message : String(e);
+    if (e && e.stack) {
+      message += '\n\n' + e.stack;
     }
     ui.alert(
       'Unable to export comments',
@@ -38,7 +58,76 @@ function showCommentsMarkdown() {
   }
 }
 
-function fetchOpenComments_(fileId) {
+function debugExportHtml() {
+  var ui = DocumentApp.getUi();
+  var prompt = ui.prompt(
+    'Document URL',
+    'Paste the URL of the Google Doc to inspect.',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (prompt.getSelectedButton() !== ui.Button.OK) {
+    return;
+  }
+
+  var match = prompt.getResponseText().trim().match(/\/d\/([a-zA-Z0-9_-]+)/);
+  if (!match) {
+    ui.alert(
+      'Unrecognised document URL',
+      'The URL was not recognised. Paste a Google Docs URL containing /d/{document-id}.',
+      ui.ButtonSet.OK
+    );
+    return;
+  }
+
+  try {
+    var fileId = match[1];
+    var html = fetchHtmlExport_(fileId);
+    var parsed = parseCommentExportHtml_(html);
+    var comments = fetchComments_(fileId);
+    var ordered = orderThreadsByDocumentPosition_(comments, fileId, html, parsed);
+
+    Logger.log('HTML length: ' + html.length);
+    Logger.log('Body markers: ' + JSON.stringify(parsed.markers));
+    Logger.log('Comment blocks: ' + JSON.stringify(parsed.blocks.map(function (block) {
+      return {
+        id: block.id,
+        refId: block.refId,
+        markerIndex: block.markerIndex === undefined ? null : block.markerIndex,
+        text: truncate_(block.text, 80)
+      };
+    })));
+    var entries = getApiEntries_(ordered);
+    Logger.log(
+      'Parsed %s body markers, %s comment blocks, %s matched API entries.',
+      parsed.markers.length,
+      parsed.blocks.length,
+      entries.filter(function (entry) {
+        return entry.markerIndex !== null;
+      }).length
+    );
+    entries.forEach(function (entry) {
+      Logger.log(
+        '%s %s: %s (marker index: %s)',
+        entry.type,
+        entry.id,
+        truncate_(normalizeText_(entry.content), 80),
+        entry.markerIndex === null ? 'not matched' : entry.markerIndex
+      );
+    });
+  } catch (e) {
+    Logger.log('Debug export failed: ' + (e.message || e));
+    if (e.stack) {
+      Logger.log(e.stack);
+    }
+    ui.alert(
+      'Unable to debug HTML export',
+      (e.message || String(e)) + (e.stack ? '\n\n' + e.stack : ''),
+      ui.ButtonSet.OK
+    );
+  }
+}
+
+function fetchComments_(fileId) {
   var comments = [];
   var pageToken;
   var fields =
@@ -58,13 +147,13 @@ function fetchOpenComments_(fileId) {
 
     var response = Drive.Comments.list(fileId, options);
     (response.comments || []).forEach(function (comment) {
-      if (comment.resolved === true || comment.deleted === true) {
+      if (comment.deleted === true) {
         return;
       }
 
       comment.replies = (comment.replies || []).filter(function (reply) {
         return reply.deleted !== true &&
-          (reply.content || reply.htmlContent || '').trim() !== '';
+          normalizeText_(reply.content || reply.htmlContent || '') !== '';
       });
       comments.push(comment);
     });
@@ -78,6 +167,283 @@ function fetchOpenComments_(fileId) {
   return comments;
 }
 
+function fetchHtmlExport_(fileId) {
+  try {
+    var blob = Drive.Files.export(fileId, 'text/html');
+    return blob && typeof blob.getDataAsString === 'function'
+      ? blob.getDataAsString()
+      : String(blob || '');
+  } catch (driveError) {
+    try {
+      var url = 'https://www.googleapis.com/drive/v3/files/' +
+        encodeURIComponent(fileId) + '/export?mimeType=text%2Fhtml';
+      var response = UrlFetchApp.fetch(url, {
+        headers: {
+          Authorization: 'Bearer ' + ScriptApp.getOAuthToken()
+        },
+        muteHttpExceptions: true
+      });
+      if (response.getResponseCode() >= 200 && response.getResponseCode() < 300) {
+        return response.getContentText();
+      }
+    } catch (fetchError) {
+      Logger.log('HTML export fallback failed: ' + fetchError);
+    }
+    Logger.log('HTML export failed: ' + driveError);
+    return '';
+  }
+}
+
+function parseCommentExportHtml_(html) {
+  var bodyMatch = String(html || '').match(/<body\b[^>]*>([\s\S]*?)<\/body\s*>/i);
+  var body = bodyMatch ? bodyMatch[1] : String(html || '');
+  var markers = [];
+  var markerByRefId = {};
+  var anchorPattern = /<a\b[^>]*>[\s\S]*?<\/a\s*>/gi;
+  var anchorMatch;
+
+  while ((anchorMatch = anchorPattern.exec(body)) !== null) {
+    var anchor = anchorMatch[0];
+    var href = getHtmlAttribute_(anchor, 'href');
+    var id = getHtmlAttribute_(anchor, 'id');
+    if (/^#cmnt[\w-]+$/i.test(href) && /^cmnt_ref[\w-]+$/i.test(id)) {
+      var marker = {
+        id: href.slice(1),
+        refId: id,
+        index: markers.length
+      };
+      markers.push(marker);
+      markerByRefId[id.toLowerCase()] = marker.index;
+    }
+  }
+
+  var blocks = [];
+  var paragraphPattern = /<p\b[^>]*>[\s\S]*?<\/p\s*>/gi;
+  var paragraphMatch;
+  while ((paragraphMatch = paragraphPattern.exec(body)) !== null) {
+    var paragraph = paragraphMatch[0];
+    var markerAnchorMatch = paragraph.match(
+      /<a\b(?=[^>]*\bid\s*=\s*(['"])cmnt[\w-]+\1)(?=[^>]*\bhref\s*=\s*(['"])#cmnt_ref[\w-]+\2)[^>]*>[\s\S]*?<\/a\s*>/i
+    );
+    if (!markerAnchorMatch) {
+      continue;
+    }
+    var markerAnchor = markerAnchorMatch[0];
+    var blockId = getHtmlAttribute_(markerAnchor, 'id');
+    var blockHref = getHtmlAttribute_(markerAnchor, 'href');
+    var rawText = paragraph.replace(markerAnchor, '');
+    blocks.push({
+      id: blockId,
+      refId: blockHref.slice(1),
+      markerIndex: markerByRefId[blockHref.slice(1).toLowerCase()],
+      text: normalizeText_(rawText)
+    });
+  }
+
+  return {
+    markers: markers,
+    blocks: blocks
+  };
+}
+
+function orderThreadsByDocumentPosition_(threads, fileId, html, parsed) {
+  var orderedThreads = threads.slice().sort(sortByCreatedTime_);
+  var exportHtml = html;
+  var exportData = parsed;
+  if (exportHtml === undefined) {
+    exportHtml = fetchHtmlExport_(fileId);
+  }
+  if (exportData === undefined) {
+    exportData = parseCommentExportHtml_(exportHtml);
+  }
+  if (!exportData.markers.length) {
+    return orderedThreads;
+  }
+
+  matchApiEntriesToBlocks_(orderedThreads, exportData.blocks);
+  orderedThreads.forEach(function (thread) {
+    var positions = getApiEntries_([thread]).map(function (entry) {
+      return entry.markerIndex;
+    }).filter(function (index) {
+      return index !== null;
+    });
+    thread.documentPosition = positions.length ? Math.min.apply(null, positions) : null;
+  });
+  return orderedThreads.sort(function (left, right) {
+    var leftPosition = left.documentPosition;
+    var rightPosition = right.documentPosition;
+    if (leftPosition === null && rightPosition === null) {
+      return sortByCreatedTime_(left, right);
+    }
+    if (leftPosition === null) {
+      return 1;
+    }
+    if (rightPosition === null) {
+      return -1;
+    }
+    return leftPosition - rightPosition;
+  });
+}
+
+function matchApiEntriesToBlocks_(threads, blocks) {
+  var entries = getApiEntries_(threads).sort(sortByCreatedTime_);
+  var entriesByText = Object.create(null);
+  var unmatchedEntries = [];
+  entries.forEach(function (entry) {
+    entry.markerIndex = null;
+    var key = normalizeText_(entry.content);
+    if (!key) {
+      return;
+    }
+    if (!Object.prototype.hasOwnProperty.call(entriesByText, key)) {
+      entriesByText[key] = [];
+    }
+    entriesByText[key].push(entry);
+    unmatchedEntries.push(entry);
+  });
+
+  var unmatchedBlocks = [];
+  blocks.forEach(function (block) {
+    var entry = popFirstUnmatchedCandidate_(entriesByText, block.text);
+    if (!entry) {
+      var variants = getMatchTextVariants_(block.text);
+      for (var i = 1; i < variants.length && !entry; i++) {
+        entry = popFirstUnmatchedCandidate_(entriesByText, variants[i]);
+      }
+    }
+    if (entry && entry.markerIndex === null &&
+        block.markerIndex !== undefined && block.markerIndex !== null) {
+      entry.markerIndex = block.markerIndex;
+      entry.target.markerIndex = block.markerIndex;
+      removeEntry_(unmatchedEntries, entry);
+    } else {
+      unmatchedBlocks.push(block);
+    }
+  });
+
+  unmatchedBlocks.forEach(function (block) {
+    if (block.markerIndex === undefined || block.markerIndex === null || !block.text) {
+      return;
+    }
+    var entry = findLooseMatchEntry_(unmatchedEntries, block.text);
+    if (entry) {
+      entry.markerIndex = block.markerIndex;
+      entry.target.markerIndex = block.markerIndex;
+      removeEntry_(unmatchedEntries, entry);
+    }
+  });
+}
+
+function popFirstUnmatchedCandidate_(entriesByText, textKey) {
+  var candidates = entriesByText[textKey] || [];
+  while (candidates.length) {
+    var entry = candidates.shift();
+    if (entry.markerIndex === null) {
+      return entry;
+    }
+  }
+  return null;
+}
+
+function getApiEntries_(threads) {
+  var entries = [];
+  threads.forEach(function (thread) {
+    entries.push({
+      id: thread.id,
+      type: 'comment',
+      content: thread.content || '',
+      createdTime: thread.createdTime || '',
+      thread: thread,
+      target: thread,
+      markerIndex: thread.markerIndex === undefined ? null : thread.markerIndex
+    });
+    (thread.replies || []).forEach(function (reply, index) {
+      entries.push({
+        id: thread.id + '/reply-' + index,
+        type: 'reply',
+        content: reply.content || '',
+        createdTime: reply.createdTime || '',
+        thread: thread,
+        reply: reply,
+        target: reply,
+        markerIndex: reply.markerIndex === undefined ? null : reply.markerIndex
+      });
+    });
+  });
+  return entries;
+}
+
+function getHtmlAttribute_(tag, name) {
+  var pattern = new RegExp(
+    '\\b' + name + '\\s*=\\s*([\'"])([\\s\\S]*?)\\1',
+    'i'
+  );
+  var match = tag.match(pattern);
+  return match ? decodeHtmlEntities_(match[2]) : '';
+}
+
+function normalizeText_(text) {
+  return decodeHtmlEntities_(String(text || '')
+    .replace(/<br\s*\/?>/gi, ' ')
+    .replace(/<[^>]*>/g, ' '))
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function findLooseMatchEntry_(entries, blockText) {
+  var variants = getMatchTextVariants_(blockText);
+  var best = null;
+  var blockLength = blockText.length;
+  entries.forEach(function (entry) {
+    var entryText = normalizeText_(entry.content);
+    if (!entryText) {
+      return;
+    }
+    if (variants.some(function (text) { return text === entryText; })) {
+      if (!best || sortByCreatedTime_(entry, best.entry) < 0) {
+        best = {entry: entry, score: 0};
+      }
+      return;
+    }
+    var contains = variants.some(function (text) {
+      return text.indexOf(entryText) !== -1 || entryText.indexOf(text) !== -1;
+    });
+    if (!contains) {
+      return;
+    }
+    var score = Math.abs(blockLength - entryText.length);
+    if (!best ||
+        score < best.score ||
+        (score === best.score && sortByCreatedTime_(entry, best.entry) < 0)) {
+      best = {entry: entry, score: score};
+    }
+  });
+  return best ? best.entry : null;
+}
+
+function getMatchTextVariants_(text) {
+  var normalized = normalizeText_(text);
+  var variants = [normalized];
+  var withoutAuthor = normalized.replace(/^[^:]{1,120}:\s+/, '');
+  if (withoutAuthor && withoutAuthor !== normalized) {
+    variants.push(withoutAuthor);
+  }
+  return variants;
+}
+
+function removeEntry_(entries, entryToRemove) {
+  var index = entries.indexOf(entryToRemove);
+  if (index !== -1) {
+    entries.splice(index, 1);
+  }
+}
+
+function truncate_(text, length) {
+  text = String(text || '');
+  return text.length > length ? text.slice(0, length - 3) + '...' : text;
+}
+
 function buildMarkdown_(title, threads) {
   var lines = ['# ' + title, '', 'Exported: ' + formatExportDate_(), ''];
 
@@ -86,6 +452,8 @@ function buildMarkdown_(title, threads) {
     var quote = thread.quotedFileContent && thread.quotedFileContent.value;
     if (quote) {
       entries.push(quoteToBlockquote_(quote));
+    } else {
+      entries.push('> [Comment on a non-text element, e.g. an image]');
     }
 
     entries.push(
@@ -162,6 +530,11 @@ function quoteToBlockquote_(text) {
 }
 
 function sortByCreatedTime_(left, right) {
+  var leftTime = Date.parse(left.createdTime || '');
+  var rightTime = Date.parse(right.createdTime || '');
+  if (!isNaN(leftTime) && !isNaN(rightTime)) {
+    return leftTime - rightTime;
+  }
   return String(left.createdTime || '').localeCompare(String(right.createdTime || ''));
 }
 
@@ -172,6 +545,7 @@ function formatExportDate_() {
     'yyyy-MM-dd'
   );
 }
+
 
 function jsonForScript_(value) {
   return JSON.stringify(value)
